@@ -9,8 +9,8 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Sans+Condensed:wght@600;700&display=swap" rel="stylesheet" />
     
 <script type="module">
-import init, * as bindings from '/coffee_dashboard-dac54ec0ecc34cff.js';
-const wasm = await init({ module_or_path: '/coffee_dashboard-dac54ec0ecc34cff_bg.wasm' });
+import init, * as bindings from '/coffee_dashboard-f9df48867a35e11b.js';
+const wasm = await init({ module_or_path: '/coffee_dashboard-f9df48867a35e11b_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -609,7 +609,188 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             .stats-grid { grid-template-columns: 1fr; }
             .main-content { padding: 14px; }
         }
+
+        /* Responsive About Modal & System Info */
+        .modal-about-box {
+            background: #F8FAFD;
+            border-radius: 16px;
+            padding: 24px;
+            width: 100%;
+            max-width: 960px;
+            max-height: 92vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+            position: relative;
+            box-sizing: border-box;
+            border: 1px solid #E2E8F0;
+        }
+
+        .about-card {
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-radius: 12px;
+            padding: 18px 20px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+            box-sizing: border-box;
+        }
+
+        .about-grid-2 {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 16px;
+        }
+
+        .about-grid-3 {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 14px;
+        }
+
+        .member-grid-2 {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .member-grid-3 {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .member-card-item {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 12px 14px;
+            border: 1px solid #E2E8F0;
+            border-radius: 10px;
+            background: #FFFFFF;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+            box-sizing: border-box;
+            min-width: 0;
+        }
+
+        .member-card-item.user-highlight {
+            border-color: #BFDBFE;
+            background: #EFF6FF;
+        }
+
+        .member-avatar {
+            width: 52px;
+            height: 52px;
+            border-radius: 8px;
+            object-fit: cover;
+            flex-shrink: 0;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        .member-info {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            min-width: 0;
+            flex: 1;
+        }
+
+        .member-name {
+            font-weight: 700;
+            font-size: 13.5px;
+            color: #0F172A;
+            line-height: 1.3;
+            word-break: break-word;
+        }
+
+        .member-nrp {
+            font-size: 11.5px;
+            color: #64748B;
+        }
+
+        .member-role {
+            font-size: 11.5px;
+            color: #2563EB;
+            font-weight: 500;
+            line-height: 1.3;
+            word-break: break-word;
+        }
+
+        .diagram-scroll-box {
+            background: #FFFFFF;
+            border: 1px solid #E2E8F0;
+            border-radius: 10px;
+            padding: 16px;
+            text-align: center;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .diagram-svg-img {
+            width: 100%;
+            min-width: 580px;
+            max-width: 900px;
+            height: auto;
+            display: inline-block;
+        }
+
+        .table-responsive-box {
+            width: 100%;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            margin-top: 10px;
+            border: 1px solid #E2E8F0;
+            border-radius: 6px;
+        }
+
+        .table-responsive-box table {
+            min-width: 480px;
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+        }
+
+        /* Mobile Adjustments for < 768px (Matching User's Friend's Mobile Layout) */
+        @media (max-width: 768px) {
+            .modal-overlay {
+                padding: 10px 8px;
+                align-items: center;
+            }
+            .modal-about-box {
+                padding: 16px 12px;
+                border-radius: 12px;
+                max-height: 94vh;
+                width: 100%;
+            }
+            .about-card {
+                padding: 14px 12px;
+            }
+            .about-grid-2 {
+                grid-template-columns: 1fr !important;
+                gap: 14px;
+            }
+            .about-grid-3 {
+                grid-template-columns: 1fr !important;
+                gap: 12px;
+            }
+            .member-grid-2 {
+                grid-template-columns: 1fr !important;
+                gap: 10px;
+            }
+            .member-grid-3 {
+                grid-template-columns: 1fr !important;
+                gap: 10px;
+            }
+            .member-card-item {
+                padding: 10px 12px;
+            }
+            .member-avatar {
+                width: 48px;
+                height: 48px;
+            }
+            .diagram-svg-img {
+                min-width: 500px;
+            }
+        }
     </style>
-<link rel="modulepreload" href="/coffee_dashboard-dac54ec0ecc34cff.js" crossorigin="anonymous" integrity="sha384-jrncFxeSoENyjINtVR8GS5e4MxpdxpCmuqD6fhZZFvle0K3bDzUJKGwuDx8FDexb"><link rel="preload" href="/coffee_dashboard-dac54ec0ecc34cff_bg.wasm" crossorigin="anonymous" integrity="sha384-iFSCNLLN5eT+jOJSfUrdY3Mk4JChBZOq2GdX1jD4xJlNG1S8Rnt/1yC8yr2N5NYp" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/coffee_dashboard-f9df48867a35e11b.js" crossorigin="anonymous" integrity="sha384-jrncFxeSoENyjINtVR8GS5e4MxpdxpCmuqD6fhZZFvle0K3bDzUJKGwuDx8FDexb"><link rel="preload" href="/coffee_dashboard-f9df48867a35e11b_bg.wasm" crossorigin="anonymous" integrity="sha384-D229I5LELpwJxdJG9esNPKQvw2Htpt+03Thbsc77ETnEBXY401X2coA/V2vGJ0KW" as="fetch" type="application/wasm"></head>
 <body></body>
 </html>
