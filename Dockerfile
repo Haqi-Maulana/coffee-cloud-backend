@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY coffee-cloud-backend-bin /usr/local/bin/coffee-cloud-backend
+COPY static /app/static
 
 ENV PORT=8080
 EXPOSE 8080

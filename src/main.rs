@@ -24,6 +24,7 @@ use tokio::{net::TcpStream, sync::Mutex};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use tower_http::{
     cors::{Any, CorsLayer},
+    services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 use tracing::{error, info, warn};
@@ -390,6 +391,32 @@ async fn post_telemetry(
     Ok((StatusCode::CREATED, Json(json!({ "status": "stored" }))))
 }
 
+async fn telemetry_info() -> impl IntoResponse {
+    Json(json!({
+        "status": "online",
+        "service": "CoffeeSense IoT - Cloud Telemetry Ingestion API",
+        "method": "POST",
+        "instructions": "Send an HTTP POST request to this endpoint with a JSON body from your ESP32-S3.",
+        "example_payload": {
+            "device_id": "ESP32-S3-01",
+            "predicted_class": "Arabica",
+            "confidence": 0.94,
+            "temperature": 28.5,
+            "humidity": 62.0,
+            "co2": 415.0,
+            "voc": 110.0,
+            "nh3": 12.0,
+            "c6h6": 4.2
+        },
+        "links": {
+            "web_dashboard": "/",
+            "health_check": "/api/health",
+            "latest_prediction": "/api/prediction/latest",
+            "dashboard_metrics": "/api/dashboard"
+        }
+    }))
+}
+
 async fn latest_prediction(
     State(st): State<AppState>,
     Query(q): Query<DeviceQuery>,
@@ -702,11 +729,15 @@ async fn main() -> anyhow::Result<()> {
         _ => info!("MQTT_HOST not set – MQTT subscriber disabled (use POST /api/telemetry)"),
     }
 
+    let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "static".into());
+    let static_service = ServeDir::new(&static_dir)
+        .not_found_service(ServeFile::new(format!("{static_dir}/index.html")));
+
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
     let app = Router::new()
         .route("/api/health", get(health))
-        .route("/api/telemetry", post(post_telemetry))
+        .route("/api/telemetry", post(post_telemetry).get(telemetry_info))
         .route("/api/prediction/latest", get(latest_prediction))
         .route("/api/predictions", get(list_predictions))
         .route("/api/dashboard", get(dashboard))
@@ -719,9 +750,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/ota/latest", get(ota_latest))
         .route("/api/ota/download/:version", get(ota_download))
         .route("/api/ota/activate/:version", post(ota_activate))
+        .with_state(AppState { db })
+        .fallback_service(static_service)
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .with_state(AppState { db });
+        .layer(TraceLayer::new_for_http());
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let default_addr = format!("0.0.0.0:{}", port);
