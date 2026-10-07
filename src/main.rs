@@ -105,6 +105,44 @@ impl Db {
     async fn ping(&self) -> anyhow::Result<()> {
         self.rows(SqlQuery::new("SELECT 1 AS ok")).await.map(|_| ())
     }
+
+    async fn init_schema(&self) -> anyhow::Result<()> {
+        let sql = "IF OBJECT_ID(N'dbo.coffee_predictions', N'U') IS NULL \
+            BEGIN \
+                CREATE TABLE dbo.coffee_predictions ( \
+                    id UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_cp_id DEFAULT NEWSEQUENTIALID() CONSTRAINT PK_coffee_predictions PRIMARY KEY, \
+                    device_id NVARCHAR(64) NOT NULL, \
+                    session_id NVARCHAR(64) NULL, \
+                    predicted_class NVARCHAR(32) NOT NULL, \
+                    confidence FLOAT NOT NULL, \
+                    temperature FLOAT NULL, \
+                    humidity FLOAT NULL, \
+                    co2 FLOAT NULL, \
+                    voc FLOAT NULL, \
+                    nh3 FLOAT NULL, \
+                    c6h6 FLOAT NULL, \
+                    validation_status NVARCHAR(32) NULL, \
+                    ground_truth NVARCHAR(32) NULL, \
+                    received_at DATETIMEOFFSET NOT NULL CONSTRAINT DF_cp_received DEFAULT SYSDATETIMEOFFSET() \
+                ); \
+            END; \
+            IF OBJECT_ID(N'dbo.ota_updates', N'U') IS NULL \
+            BEGIN \
+                CREATE TABLE dbo.ota_updates ( \
+                    id INT IDENTITY(1,1) CONSTRAINT PK_ota_updates PRIMARY KEY, \
+                    firmware_version NVARCHAR(32) NOT NULL CONSTRAINT UQ_ota_version UNIQUE, \
+                    target_device NVARCHAR(64) NULL, \
+                    binary_data VARBINARY(MAX) NOT NULL, \
+                    checksum_sha256 NVARCHAR(64) NOT NULL, \
+                    file_size_bytes BIGINT NOT NULL, \
+                    release_notes NVARCHAR(MAX) NULL, \
+                    is_active BIT NOT NULL CONSTRAINT DF_ota_active DEFAULT 0, \
+                    created_at DATETIMEOFFSET NOT NULL CONSTRAINT DF_ota_created DEFAULT SYSDATETIMEOFFSET() \
+                ); \
+            END;";
+        self.execute(SqlQuery::new(sql)).await?;
+        Ok(())
+    }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -647,6 +685,12 @@ async fn main() -> anyhow::Result<()> {
 
     if let Err(e) = db.ping().await {
         warn!("Azure SQL not reachable yet ({e:#}); will retry on each request");
+    } else {
+        if let Err(e) = db.init_schema().await {
+            warn!("Failed to auto-initialize schema ({e:#})");
+        } else {
+            info!("Azure SQL database schema verified / initialized successfully");
+        }
     }
 
     match std::env::var("MQTT_HOST") {
