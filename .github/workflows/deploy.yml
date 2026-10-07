@@ -46,3 +46,15 @@ jobs:
           context: .
           push: true
           tags: ghcr.io/haqi-maulana/coffee-cloud-backend:latest
+
+      - name: Trigger Azure App Service Webhook to Auto-Deploy
+        env:
+          WEBHOOK_URL: ${{ secrets.AZURE_WEBHOOK_URL }}
+        run: |
+          if [ -n "$WEBHOOK_URL" ]; then
+            echo "Triggering Azure Deployment Webhook..."
+            curl -i -X POST "$WEBHOOK_URL"
+          else
+            echo "Triggering default Azure Deployment Webhook..."
+            curl -i -X POST "https://\$coffeesense-api-its:yS8McnpHptmjEfDDbgqdmcT0TSSHllzghSwiANqj0iAEceReqbZPL4RJfGtf@coffeesense-api-its-hnffhra3bgbrbwd9.scm.indonesiacentral-01.azurewebsites.net/api/registry/webhook"
+          fi
