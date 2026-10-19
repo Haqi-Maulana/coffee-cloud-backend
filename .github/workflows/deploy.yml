@@ -51,10 +51,8 @@ jobs:
         env:
           WEBHOOK_URL: ${{ secrets.AZURE_WEBHOOK_URL }}
         run: |
-          if [ -n "$WEBHOOK_URL" ]; then
-            echo "Triggering Azure Deployment Webhook..."
-            curl -i -X POST "$WEBHOOK_URL"
-          else
-            echo "Triggering default Azure Deployment Webhook..."
-            curl -i -X POST "https://\$coffeesense-api-its:yS8McnpHptmjEfDDbgqdmcT0TSSHllzghSwiANqj0iAEceReqbZPL4RJfGtf@coffeesense-api-its-hnffhra3bgbrbwd9.scm.indonesiacentral-01.azurewebsites.net/api/registry/webhook"
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "Secret AZURE_WEBHOOK_URL belum diisi"
+            exit 1
           fi
+          curl -fsS -X POST "$WEBHOOK_URL"
