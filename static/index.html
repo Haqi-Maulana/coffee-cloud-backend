@@ -9,8 +9,8 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Sans+Condensed:wght@600;700&display=swap" rel="stylesheet" />
     
 <script type="module">
-import init, * as bindings from '/coffee_dashboard-f9df48867a35e11b.js';
-const wasm = await init({ module_or_path: '/coffee_dashboard-f9df48867a35e11b_bg.wasm' });
+import init, * as bindings from '/coffee_dashboard-696c66175df6d3ac.js';
+const wasm = await init({ module_or_path: '/coffee_dashboard-696c66175df6d3ac_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -599,13 +599,136 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
         @keyframes slideLeft { from { transform: translateX(100%); } to { transform: translateX(0); } }
 
+        /* Mobile Top Bar & Navigation Bar (Hidden on Desktop) */
+        .mobile-topbar {
+            display: none;
+        }
+        .mobile-nav-bar {
+            display: none;
+        }
+        .sidebar-backdrop {
+            display: none;
+        }
+
         /* Responsive */
         @media (max-width: 1200px) {
             .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .dash-columns { grid-template-columns: 1fr; }
         }
         @media (max-width: 840px) {
-            .sidebar { display: none; }
+            .app-container {
+                flex-direction: column;
+            }
+            .sidebar {
+                position: fixed;
+                top: 0;
+                left: 0;
+                bottom: 0;
+                width: 260px;
+                height: 100vh;
+                z-index: 95;
+                transform: translateX(-100%);
+                transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+                box-shadow: 6px 0 24px rgba(0, 0, 0, 0.35);
+            }
+            .sidebar.mobile-open {
+                transform: translateX(0);
+            }
+            .sidebar-backdrop.mobile-open {
+                display: block;
+                position: fixed;
+                inset: 0;
+                background: rgba(9, 16, 36, 0.55);
+                backdrop-filter: blur(2px);
+                z-index: 90;
+                animation: fadeIn 0.15s ease;
+            }
+            .mobile-topbar {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                background: linear-gradient(90deg, var(--navy-primary) 0%, var(--navy-dark) 100%);
+                color: #FFF;
+                padding: 12px 16px;
+                position: sticky;
+                top: 0;
+                z-index: 80;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+            }
+            .mobile-topbar-brand {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            .mobile-topbar-logo {
+                width: 34px;
+                height: 34px;
+                border-radius: 8px;
+                background: rgba(255,255,255,0.12);
+                display: grid;
+                place-items: center;
+                color: #FFF;
+            }
+            .mobile-topbar-title h2 {
+                font-size: 15px;
+                font-weight: 700;
+                color: #FFF;
+                line-height: 1.2;
+            }
+            .mobile-topbar-title p {
+                font-size: 10.5px;
+                color: #94A3B8;
+                line-height: 1.2;
+            }
+            .mobile-menu-btn {
+                width: 38px;
+                height: 38px;
+                border-radius: 8px;
+                border: 1px solid rgba(255,255,255,0.18);
+                background: rgba(255,255,255,0.08);
+                color: #FFF;
+                display: grid;
+                place-items: center;
+                cursor: pointer;
+            }
+            .mobile-nav-bar {
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 6px;
+                background: var(--navy-primary);
+                padding: 8px 10px;
+                border-top: 1px solid rgba(255,255,255,0.08);
+                position: sticky;
+                top: 58px;
+                z-index: 79;
+                box-shadow: 0 4px 12px rgba(15, 27, 61, 0.12);
+            }
+            .mobile-nav-btn {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                gap: 4px;
+                padding: 7px 4px;
+                border: none;
+                border-radius: 8px;
+                background: transparent;
+                color: #CBD5E1;
+                font-size: 11px;
+                font-weight: 500;
+                cursor: pointer;
+                transition: all 0.15s ease;
+                text-align: center;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .mobile-nav-btn.active {
+                background: var(--navy-active);
+                color: #FFF;
+                font-weight: 700;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.25);
+            }
             .stats-grid { grid-template-columns: 1fr; }
             .main-content { padding: 14px; }
         }
@@ -791,6 +914,6 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             }
         }
     </style>
-<link rel="modulepreload" href="/coffee_dashboard-f9df48867a35e11b.js" crossorigin="anonymous" integrity="sha384-jrncFxeSoENyjINtVR8GS5e4MxpdxpCmuqD6fhZZFvle0K3bDzUJKGwuDx8FDexb"><link rel="preload" href="/coffee_dashboard-f9df48867a35e11b_bg.wasm" crossorigin="anonymous" integrity="sha384-D229I5LELpwJxdJG9esNPKQvw2Htpt+03Thbsc77ETnEBXY401X2coA/V2vGJ0KW" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/coffee_dashboard-696c66175df6d3ac.js" crossorigin="anonymous" integrity="sha384-rPjvxk547S3bS8bFulc0SeZXrKStd0OjmeCqR4VGOdFI+VF8WXWr6kwtP42Zh/Ns"><link rel="preload" href="/coffee_dashboard-696c66175df6d3ac_bg.wasm" crossorigin="anonymous" integrity="sha384-36t4uA2FVHwktPj11qlvVX4WyXlM0rUbOkl/EBweqW6ISMAoxcgsetWj144PpPWP" as="fetch" type="application/wasm"></head>
 <body></body>
 </html>

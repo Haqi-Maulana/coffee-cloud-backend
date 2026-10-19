@@ -209,9 +209,40 @@ struct DeviceQuery {
     device_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateQcPayload {
+    validation_status: String,
+    ground_truth: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceCommand {
+    id: i64,
+    device_id: String,
+    command: String,
+    params: Option<serde_json::Value>,
+    status: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendCommandPayload {
+    device_id: String,
+    command: String,
+    params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AckCommandPayload {
+    command_id: i64,
+    status: Option<String>,
+}
+
 #[derive(Clone)]
 struct AppState {
     db: Db,
+    commands: Arc<Mutex<Vec<DeviceCommand>>>,
+    mqtt_tx: Option<AsyncClient>,
 }
 
 // ════════════════════════════════════════════════════════════
@@ -647,11 +678,113 @@ async fn ota_activate(
     Ok(Json(json!({ "status": "activated", "version": version })))
 }
 
+async fn update_prediction_qc(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateQcPayload>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut q = SqlQuery::new(
+        "UPDATE dbo.coffee_predictions \
+         SET validation_status = @P1, ground_truth = @P2 \
+         WHERE CONVERT(NVARCHAR(36), id) = @P3 OR session_id = @P3",
+    );
+    q.bind(payload.validation_status.clone());
+    q.bind(payload.ground_truth.clone());
+    q.bind(id.clone());
+    let affected = st.db.execute(q).await?;
+    info!(id = %id, status = %payload.validation_status, affected, "QC updated");
+    Ok(Json(json!({
+        "status": "updated",
+        "id": id,
+        "validation_status": payload.validation_status,
+        "ground_truth": payload.ground_truth,
+        "affected_rows": affected
+    })))
+}
+
+async fn post_device_command(
+    State(st): State<AppState>,
+    Json(payload): Json<SendCommandPayload>,
+) -> ApiResult<(StatusCode, Json<DeviceCommand>)> {
+    let cmd = DeviceCommand {
+        id: Utc::now().timestamp_millis(),
+        device_id: payload.device_id.clone(),
+        command: payload.command.clone(),
+        params: payload.params.clone(),
+        status: "pending".into(),
+        created_at: Utc::now(),
+    };
+
+    // Publish via MQTT if client is available
+    if let Some(ref mqtt) = st.mqtt_tx {
+        let cmd_topic = std::env::var("MQTT_COMMAND_TOPIC")
+            .unwrap_or_else(|_| format!("coffee/command/{}", payload.device_id));
+        if let Ok(bytes) = serde_json::to_vec(&cmd) {
+            let mqtt_clone = mqtt.clone();
+            tokio::spawn(async move {
+                let _ = mqtt_clone.publish(cmd_topic, QoS::AtLeastOnce, false, bytes).await;
+            });
+        }
+    }
+
+    let mut guard = st.commands.lock().await;
+    guard.push(cmd.clone());
+    if guard.len() > 200 {
+        guard.remove(0);
+    }
+
+    info!(device_id = %cmd.device_id, command = %cmd.command, "Device command queued");
+    Ok((StatusCode::CREATED, Json(cmd)))
+}
+
+async fn get_device_command(
+    State(st): State<AppState>,
+    Query(q): Query<DeviceQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut guard = st.commands.lock().await;
+    let target_dev = q.device_id.as_deref().unwrap_or("");
+    let mut pending = Vec::new();
+
+    for c in guard.iter_mut() {
+        if c.status == "pending"
+            && (target_dev.is_empty() || c.device_id == target_dev || c.device_id == "ALL")
+        {
+            c.status = "dispatched".into();
+            pending.push(c.clone());
+        }
+    }
+
+    let recent: Vec<DeviceCommand> = guard.iter().rev().take(15).cloned().collect();
+    Ok(Json(json!({
+        "pending_commands": pending,
+        "recent_history": recent,
+        "server_time": Utc::now(),
+    })))
+}
+
+async fn ack_device_command(
+    State(st): State<AppState>,
+    Json(payload): Json<AckCommandPayload>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut guard = st.commands.lock().await;
+    let new_status = payload.status.unwrap_or_else(|| "executed".into());
+    for c in guard.iter_mut() {
+        if c.id == payload.command_id {
+            c.status = new_status.clone();
+        }
+    }
+    Ok(Json(json!({
+        "status": "acknowledged",
+        "command_id": payload.command_id,
+        "new_status": new_status
+    })))
+}
+
 // ════════════════════════════════════════════════════════════
 // MQTT subscriber
 // ════════════════════════════════════════════════════════════
 
-async fn run_mqtt(db: Db, host: String, port: u16, topic: String) {
+fn start_mqtt(db: Db, host: String, port: u16, topic: String) -> AsyncClient {
     let client_id = format!("coffeesense-backend-{}", Utc::now().timestamp_millis());
     let mut opts = MqttOptions::new(client_id, host.clone(), port);
     opts.set_keep_alive(Duration::from_secs(30));
@@ -660,36 +793,41 @@ async fn run_mqtt(db: Db, host: String, port: u16, topic: String) {
     }
 
     let (client, mut eventloop) = AsyncClient::new(opts, 64);
+    let sub_client = client.clone();
 
-    loop {
-        match eventloop.poll().await {
-            // (Re)subscribe on every successful (re)connect.
-            Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                info!("MQTT connected to {host}:{port}, subscribing to '{topic}'");
-                if let Err(e) = client.subscribe(topic.clone(), QoS::AtLeastOnce).await {
-                    error!("MQTT subscribe failed: {e}");
-                }
-            }
-            Ok(Event::Incoming(Packet::Publish(msg))) => {
-                match serde_json::from_slice::<TelemetryPayload>(&msg.payload) {
-                    Ok(payload) => {
-                        let db = db.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = insert_telemetry(&db, payload).await {
-                                error!("failed to store MQTT telemetry: {e:#}");
-                            }
-                        });
+    tokio::spawn(async move {
+        loop {
+            match eventloop.poll().await {
+                // (Re)subscribe on every successful (re)connect.
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    info!("MQTT connected to {host}:{port}, subscribing to '{topic}'");
+                    if let Err(e) = sub_client.subscribe(topic.clone(), QoS::AtLeastOnce).await {
+                        error!("MQTT subscribe failed: {e}");
                     }
-                    Err(e) => warn!("invalid MQTT payload on '{}': {e}", msg.topic),
                 }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                warn!("MQTT connection error: {e} – retrying in 5s");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(Event::Incoming(Packet::Publish(msg))) => {
+                    match serde_json::from_slice::<TelemetryPayload>(&msg.payload) {
+                        Ok(payload) => {
+                            let db = db.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = insert_telemetry(&db, payload).await {
+                                    error!("failed to store MQTT telemetry: {e:#}");
+                                }
+                            });
+                        }
+                        Err(e) => warn!("invalid MQTT payload on '{}': {e}", msg.topic),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("MQTT connection error: {e} – retrying in 5s");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             }
         }
-    }
+    });
+
+    client
 }
 
 // ════════════════════════════════════════════════════════════
@@ -720,14 +858,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    match std::env::var("MQTT_HOST") {
+    let mqtt_tx = match std::env::var("MQTT_HOST") {
         Ok(host) if !host.trim().is_empty() => {
             let port = std::env::var("MQTT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(1883);
             let topic = std::env::var("MQTT_TOPIC").unwrap_or_else(|_| "coffee/telemetry".into());
-            tokio::spawn(run_mqtt(db.clone(), host, port, topic));
+            Some(start_mqtt(db.clone(), host, port, topic))
         }
-        _ => info!("MQTT_HOST not set – MQTT subscriber disabled (use POST /api/telemetry)"),
-    }
+        _ => {
+            info!("MQTT_HOST not set – MQTT subscriber disabled (use POST /api/telemetry)");
+            None
+        }
+    };
 
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "static".into());
     let static_service = ServeDir::new(&static_dir)
@@ -740,8 +881,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/telemetry", post(post_telemetry).get(telemetry_info))
         .route("/api/prediction/latest", get(latest_prediction))
         .route("/api/predictions", get(list_predictions))
+        .route("/api/predictions/:id/qc", post(update_prediction_qc))
         .route("/api/dashboard", get(dashboard))
         .route("/api/export/csv", get(export_csv))
+        .route("/api/device/command", post(post_device_command).get(get_device_command))
+        .route("/api/device/command/ack", post(ack_device_command))
         .route("/api/ota", get(ota_list))
         .route(
             "/api/ota/upload",
@@ -750,7 +894,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/ota/latest", get(ota_latest))
         .route("/api/ota/download/:version", get(ota_download))
         .route("/api/ota/activate/:version", post(ota_activate))
-        .with_state(AppState { db })
+        .with_state(AppState {
+            db,
+            commands: Arc::new(Mutex::new(Vec::new())),
+            mqtt_tx,
+        })
         .fallback_service(static_service)
         .layer(cors)
         .layer(TraceLayer::new_for_http());
