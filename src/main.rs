@@ -11,7 +11,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{header, HeaderName, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use chrono::{DateTime, Local, Utc};
@@ -243,6 +243,8 @@ struct AppState {
     db: Db,
     commands: Arc<Mutex<Vec<DeviceCommand>>>,
     mqtt_tx: Option<AsyncClient>,
+    devices: DeviceMap,
+    started: std::time::Instant,
 }
 
 // ════════════════════════════════════════════════════════════
@@ -418,7 +420,14 @@ async fn post_telemetry(
     State(st): State<AppState>,
     Json(payload): Json<TelemetryPayload>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let mut patch = JsonMap::new();
+    patch.insert(
+        "live".into(),
+        json!({ "v": [null,null,null,null,null,null,null,null], "temp_c": payload.temperature, "rh_pct": payload.humidity }),
+    );
+    let dev_id = payload.device_id.clone();
     insert_telemetry(&st.db, payload).await?;
+    touch_device(&st.devices, &dev_id, patch).await;
     Ok((StatusCode::CREATED, Json(json!({ "status": "stored" }))))
 }
 
@@ -686,7 +695,7 @@ async fn update_prediction_qc(
     let mut q = SqlQuery::new(
         "UPDATE dbo.coffee_predictions \
          SET validation_status = @P1, ground_truth = @P2 \
-         WHERE CONVERT(NVARCHAR(36), id) = @P3 OR session_id = @P3",
+         WHERE CONVERT(NVARCHAR(36), id) = @P3",
     );
     q.bind(payload.validation_status.clone());
     q.bind(payload.ground_truth.clone());
@@ -877,6 +886,22 @@ async fn main() -> anyhow::Result<()> {
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
     let app = Router::new()
+        .route("/api/status", get(api_status))
+        .route("/api/auth/check", get(auth_check))
+        .route("/api/devices", get(api_devices))
+        .route("/api/devices/:id/live", get(device_live))
+        .route("/api/devices/:id/commands", post(device_post_command).get(device_poll_command))
+        .route("/api/devices/:id/heartbeat", post(device_heartbeat))
+        .route("/api/devices/:id/ack", post(device_ack))
+        .route("/api/measurements", get(api_measurements))
+        .route("/api/measurements/:id", get(api_measurement_one))
+        .route("/api/measurements/:id/qc", patch(api_patch_qc))
+        .route("/api/stats", get(api_stats))
+        .route("/api/ota/packages", get(api_ota_packages))
+        .route("/api/ota/assign", post(api_ota_assign))
+        .route("/api/ota/devices/:id", get(api_ota_device))
+        .route("/api/export/metadata.csv", get(export_csv))
+        .route("/api/export/measurements.json", get(api_export_json))
         .route("/api/health", get(health))
         .route("/api/telemetry", post(post_telemetry).get(telemetry_info))
         .route("/api/prediction/latest", get(latest_prediction))
@@ -898,6 +923,8 @@ async fn main() -> anyhow::Result<()> {
             db,
             commands: Arc::new(Mutex::new(Vec::new())),
             mqtt_tx,
+            devices: Arc::new(Mutex::new(HashMap::new())),
+            started: std::time::Instant::now(),
         })
         .fallback_service(static_service)
         .layer(cors)
@@ -914,4 +941,506 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// ════════════════════════════════════════════════════════════
+// Reference-compatible API (Smart Coffee E-Nose contract)
+//
+//   GET  /api/status
+//   GET  /api/devices                      GET  /api/devices/:id/live?since=
+//   POST /api/devices/:id/commands         {type: zero_baseline|check_ota|reboot|set_config|stop, ...}
+//   POST /api/devices/:id/heartbeat        (ESP32-S3 → cloud; returns {command})
+//   GET  /api/devices/:id/commands         (ESP32-S3 polls pending command)
+//   POST /api/devices/:id/ack              {command_id, status, message}
+//   GET  /api/measurements[?limit&offset]  GET  /api/measurements/:id
+//   PATCH /api/measurements/:id/qc         {qc_flag, notes}
+//   GET  /api/stats                        GET  /api/auth/check
+//   GET  /api/ota/packages                 POST /api/ota/assign   GET /api/ota/devices/:id
+//   GET  /api/export/metadata.csv          GET  /api/export/measurements.json
+// ════════════════════════════════════════════════════════════
+
+use std::collections::HashMap;
+
+type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+#[derive(Default)]
+struct DeviceRec {
+    data: JsonMap,
+    first_seen: Option<DateTime<Utc>>,
+    last_seen: Option<DateTime<Utc>>,
+    pending: Option<serde_json::Value>,
+    last_ack: Option<serde_json::Value>,
+    live: Vec<serde_json::Value>,
+}
+
+type DeviceMap = Arc<Mutex<HashMap<String, DeviceRec>>>;
+
+const ONLINE_WINDOW_S: f64 = 20.0;
+
+fn device_json(id: &str, rec: &DeviceRec) -> serde_json::Value {
+    let now = Utc::now();
+    let secs = rec
+        .last_seen
+        .map(|t| (now - t).num_milliseconds() as f64 / 1000.0)
+        .unwrap_or(f64::MAX);
+    let mut m: JsonMap = JsonMap::new();
+    m.insert("fw_title".into(), json!("smart-coffee-enose"));
+    m.insert("fw_version".into(), json!(null));
+    m.insert("state".into(), json!("idle"));
+    m.insert("ip".into(), json!(null));
+    m.insert("mac".into(), json!(null));
+    m.insert("rssi".into(), json!(null));
+    m.insert("free_heap".into(), json!(null));
+    m.insert("model_ready".into(), json!(false));
+    m.insert("sample_period_ms".into(), json!(1000));
+    m.insert("samples_done".into(), json!(0));
+    m.insert("samples_total".into(), json!(0));
+    m.insert("measurement_id".into(), json!(null));
+    m.insert("zero_baseline".into(), json!(null));
+    m.insert("zero_baseline_at".into(), json!(null));
+    m.insert("sensors".into(), json!({"ads_a": false, "ads_b": false, "dht": false}));
+    m.insert("ota".into(), json!({"state": "IDLE", "progress": 0.0, "message": null}));
+    m.insert(
+        "live".into(),
+        json!({"rh_pct": null, "temp_c": null, "v": [null,null,null,null,null,null,null,null]}),
+    );
+    for (k, v) in rec.data.iter() {
+        m.insert(k.clone(), v.clone());
+    }
+    m.insert("device_id".into(), json!(id));
+    m.insert("first_seen".into(), json!(rec.first_seen));
+    m.insert("last_seen".into(), json!(rec.last_seen));
+    m.insert("online".into(), json!(secs < ONLINE_WINDOW_S));
+    m.insert(
+        "seconds_since_seen".into(),
+        if secs.is_finite() && secs < 1e12 { json!(secs) } else { json!(null) },
+    );
+    m.insert("pending_command".into(), rec.pending.clone().unwrap_or(json!(null)));
+    m.insert("last_ack".into(), rec.last_ack.clone().unwrap_or(json!(null)));
+    serde_json::Value::Object(m)
+}
+
+/// Merge a heartbeat / telemetry snapshot into the device registry.
+async fn touch_device(devices: &DeviceMap, id: &str, patch: JsonMap) {
+    let mut g = devices.lock().await;
+    let rec = g.entry(id.to_string()).or_default();
+    let now = Utc::now();
+    rec.first_seen.get_or_insert(now);
+    rec.last_seen = Some(now);
+    for (k, v) in patch {
+        if k == "live" {
+            if let Some(obj) = v.as_object() {
+                rec.live.push(json!({
+                    "t": now.timestamp_millis(),
+                    "v": obj.get("v").cloned().unwrap_or(json!([])),
+                    "temp_c": obj.get("temp_c").cloned().unwrap_or(json!(null)),
+                    "rh_pct": obj.get("rh_pct").cloned().unwrap_or(json!(null)),
+                }));
+                if rec.live.len() > 600 {
+                    rec.live.remove(0);
+                }
+            }
+        }
+        rec.data.insert(k, v);
+    }
+}
+
+fn operator_key_ok(headers: &axum::http::HeaderMap) -> bool {
+    match std::env::var("OPERATOR_KEY") {
+        Ok(k) if !k.trim().is_empty() => headers
+            .get("x-operator-key")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == k)
+            .unwrap_or(false),
+        _ => true, // no key configured → open (demo mode)
+    }
+}
+
+async fn auth_check(headers: axum::http::HeaderMap) -> Json<serde_json::Value> {
+    let configured = std::env::var("OPERATOR_KEY").map(|k| !k.trim().is_empty()).unwrap_or(false);
+    Json(json!({ "ok": operator_key_ok(&headers), "required": configured }))
+}
+
+async fn api_status(State(st): State<AppState>) -> Json<serde_json::Value> {
+    let t0 = std::time::Instant::now();
+    let db_ok = st.db.ping().await.is_ok();
+    let db_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let readings = if db_ok {
+        fetch_range(&st.db, 525_600, 100_000, None).await.map(|r| r.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    let devices: Vec<serde_json::Value> = {
+        let g = st.devices.lock().await;
+        let mut v: Vec<_> = g.iter().map(|(id, r)| device_json(id, r)).collect();
+        v.sort_by(|a, b| a["device_id"].as_str().cmp(&b["device_id"].as_str()));
+        v
+    };
+    Json(json!({
+        "backend": {
+            "ok": true,
+            "latency_ms": 0.0,
+            "server_time": Utc::now().to_rfc3339(),
+            "uptime_s": st.started.elapsed().as_secs(),
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "database": {
+            "kind": "azure-sql",
+            "ok": db_ok,
+            "latency_ms": db_ms,
+            "readings": readings,
+            "samples": 0,
+            "sessions": readings,
+        },
+        "devices": devices,
+        "fw_title": "smart-coffee-enose",
+        "model": {
+            "name": "Edge Impulse (on-device TinyML)",
+            "version": "none",
+            "confidence_threshold": 0.6,
+            "metric": null,
+            "validation": null,
+        },
+        "mqtt": { "configured": st.mqtt_tx.is_some() },
+    }))
+}
+
+async fn api_devices(State(st): State<AppState>) -> Json<serde_json::Value> {
+    let g = st.devices.lock().await;
+    let mut v: Vec<_> = g.iter().map(|(id, r)| device_json(id, r)).collect();
+    v.sort_by(|a, b| a["device_id"].as_str().cmp(&b["device_id"].as_str()));
+    Json(json!(v))
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveQuery {
+    since: Option<i64>,
+}
+
+async fn device_live(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<LiveQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let g = st.devices.lock().await;
+    let rec = g.get(&id).ok_or_else(|| not_found("device"))?;
+    let since = q.since.unwrap_or(0);
+    let samples: Vec<_> = rec
+        .live
+        .iter()
+        .filter(|s| s["t"].as_i64().unwrap_or(0) > since)
+        .cloned()
+        .collect();
+    Ok(Json(json!({ "device": device_json(&id, rec), "samples": samples })))
+}
+
+/// Dashboard → device command (zero_baseline | check_ota | reboot | set_config | stop).
+async fn device_post_command(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    if !operator_key_ok(&headers) {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "operator key required".into()));
+    }
+    let ctype = body
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| bad_request("field 'type' is required"))?
+        .to_string();
+    let cmd_id = Utc::now().timestamp_millis();
+    let mut cmd = body.as_object().cloned().unwrap_or_default();
+    cmd.insert("id".into(), json!(cmd_id));
+    cmd.insert("device_id".into(), json!(id));
+    cmd.insert("type".into(), json!(ctype));
+    cmd.insert("status".into(), json!("pending"));
+    cmd.insert("created_at".into(), json!(Utc::now()));
+    let cmd = serde_json::Value::Object(cmd);
+
+    {
+        let mut g = st.devices.lock().await;
+        let rec = g.entry(id.clone()).or_default();
+        rec.pending = Some(cmd.clone());
+    }
+    // legacy history list + MQTT publish
+    {
+        let mut h = st.commands.lock().await;
+        h.push(DeviceCommand {
+            id: cmd_id,
+            device_id: id.clone(),
+            command: ctype.clone(),
+            params: Some(cmd.clone()),
+            status: "pending".into(),
+            created_at: Utc::now(),
+        });
+        if h.len() > 200 {
+            h.remove(0);
+        }
+    }
+    if let Some(mqtt) = st.mqtt_tx.clone() {
+        let topic = std::env::var("MQTT_COMMAND_TOPIC")
+            .unwrap_or_else(|_| format!("coffee/command/{id}"));
+        if let Ok(bytes) = serde_json::to_vec(&cmd) {
+            tokio::spawn(async move {
+                let _ = mqtt.publish(topic, QoS::AtLeastOnce, false, bytes).await;
+            });
+        }
+    }
+    info!(device = %id, command = %ctype, "command queued");
+    Ok((StatusCode::ACCEPTED, Json(cmd)))
+}
+
+/// ESP32-S3 → cloud heartbeat. Body may contain: state, fw_version, rssi, ip, mac,
+/// free_heap, sensors{}, live{v[8],temp_c,rh_pct}, samples_done, samples_total, ota{}, zero_baseline...
+/// Response carries the pending command (if any), which is then marked dispatched.
+async fn device_heartbeat(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let patch = body.as_object().cloned().unwrap_or_default();
+    touch_device(&st.devices, &id, patch).await;
+    let cmd = {
+        let mut g = st.devices.lock().await;
+        g.get_mut(&id).and_then(|r| r.pending.take())
+    };
+    if let Some(c) = &cmd {
+        let cid = c["id"].as_i64().unwrap_or(0);
+        let mut h = st.commands.lock().await;
+        for x in h.iter_mut() {
+            if x.id == cid {
+                x.status = "dispatched".into();
+            }
+        }
+    }
+    Json(json!({ "ok": true, "command": cmd, "server_time": Utc::now() }))
+}
+
+async fn device_poll_command(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let cmd = {
+        let mut g = st.devices.lock().await;
+        let rec = g.entry(id.clone()).or_default();
+        rec.last_seen = Some(Utc::now());
+        rec.first_seen.get_or_insert(Utc::now());
+        rec.pending.take()
+    };
+    Json(json!({ "command": cmd }))
+}
+
+async fn device_ack(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let cid = body.get("command_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("executed").to_string();
+    {
+        let mut g = st.devices.lock().await;
+        let rec = g.entry(id.clone()).or_default();
+        rec.last_ack = Some(json!({
+            "command_id": cid, "status": status,
+            "message": body.get("message").cloned().unwrap_or(json!(null)),
+            "at": Utc::now(),
+        }));
+        if let Some(zb) = body.get("zero_baseline") {
+            rec.data.insert("zero_baseline".into(), zb.clone());
+            rec.data.insert("zero_baseline_at".into(), json!(Utc::now()));
+        }
+    }
+    let mut h = st.commands.lock().await;
+    for x in h.iter_mut() {
+        if x.id == cid {
+            x.status = status.clone();
+        }
+    }
+    Json(json!({ "ok": true }))
+}
+
+// ── measurements (mapped from dbo.coffee_predictions) ─────────────────
+
+fn species_of(class: &str) -> &'static str {
+    let c = class.to_lowercase();
+    if c.contains("arab") { "Arabica" }
+    else if c.contains("robu") { "Robusta" }
+    else if c.contains("libe") { "Liberica" }
+    else { "?" }
+}
+
+fn measurement_json(p: &Prediction) -> serde_json::Value {
+    json!({
+        "measurement_id": p.id,
+        "session_id": p.session_id,
+        "device_id": p.device_id,
+        "daq_id": p.device_id,
+        "coffee_id": null,
+        "batch_id": null,
+        "species": species_of(&p.predicted_class),
+        "status": "completed",
+        "qc_flag": p.validation_status.clone().unwrap_or_else(|| "OK".into()),
+        "notes": p.ground_truth,
+        "duration_s": 500,
+        "dry_run": false,
+        "created_at": p.received_at,
+        "finished_at": p.received_at,
+        "result": {
+            "predicted_class": p.predicted_class,
+            "confidence": p.confidence,
+            "temperature": p.temperature,
+            "humidity": p.humidity,
+            "co2": p.co2, "voc": p.voc, "nh3": p.nh3, "c6h6": p.c6h6,
+        }
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ListQuery {
+    limit: Option<i32>,
+    offset: Option<usize>,
+    device_id: Option<String>,
+}
+
+async fn api_measurements(
+    State(st): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let all = fetch_range(&st.db, 525_600, 5_000, q.device_id).await?;
+    let total = all.len();
+    let off = q.offset.unwrap_or(0);
+    let lim = q.limit.unwrap_or(200).clamp(1, 5_000) as usize;
+    let items: Vec<_> = all.iter().skip(off).take(lim).map(measurement_json).collect();
+    Ok(Json(json!({ "items": items, "total": total })))
+}
+
+async fn api_measurement_one(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut q = SqlQuery::new(format!(
+        "SELECT {PREDICTION_COLS} FROM dbo.coffee_predictions WHERE CONVERT(NVARCHAR(36), id) = @P1"
+    ));
+    q.bind(id);
+    let rows = st.db.rows(q).await?;
+    let p = rows.first().map(row_to_prediction).transpose()?.ok_or_else(|| not_found("measurement"))?;
+    Ok(Json(measurement_json(&p)))
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchQc {
+    qc_flag: String,
+    notes: Option<String>,
+}
+
+async fn api_patch_qc(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(b): Json<PatchQc>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !operator_key_ok(&headers) {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "operator key required".into()));
+    }
+    let flag = b.qc_flag.to_uppercase();
+    if !["OK", "SUSPECT", "REJECT"].contains(&flag.as_str()) {
+        return Err(bad_request("qc_flag must be OK, SUSPECT or REJECT"));
+    }
+    let mut q = SqlQuery::new(
+        "UPDATE dbo.coffee_predictions SET validation_status = @P1, ground_truth = @P2 \
+         WHERE CONVERT(NVARCHAR(36), id) = @P3",
+    );
+    q.bind(flag.clone());
+    q.bind(b.notes.clone());
+    q.bind(id.clone());
+    if st.db.execute(q).await? == 0 {
+        return Err(not_found("measurement"));
+    }
+    Ok(Json(json!({ "measurement_id": id, "qc_flag": flag, "notes": b.notes })))
+}
+
+async fn api_stats(State(st): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let all = fetch_range(&st.db, 525_600, 5_000, None).await?;
+    let mut by_class: HashMap<String, u32> = HashMap::new();
+    let mut by_qc: HashMap<String, u32> = HashMap::new();
+    let mut conf_sum = 0.0;
+    for p in &all {
+        *by_class.entry(p.predicted_class.clone()).or_default() += 1;
+        *by_qc.entry(p.validation_status.clone().unwrap_or_else(|| "OK".into())).or_default() += 1;
+        conf_sum += p.confidence;
+    }
+    Ok(Json(json!({
+        "total": all.len(),
+        "by_predicted_class": by_class,
+        "by_qc": by_qc,
+        "by_status": { "completed": all.len() },
+        "latest": all.first().map(measurement_json),
+        "mean_confidence": if all.is_empty() { None } else { Some(conf_sum / all.len() as f64) },
+        "mean_inference_ms": null,
+    })))
+}
+
+// ── OTA (mapped from dbo.ota_updates) ────────────────────────────────
+
+async fn api_ota_packages(State(st): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let q = SqlQuery::new(format!("SELECT {OTA_COLS} FROM dbo.ota_updates ORDER BY created_at DESC"));
+    let list = st.db.rows(q).await?.iter().map(row_to_ota).collect::<anyhow::Result<Vec<_>>>()?;
+    let out: Vec<_> = list
+        .iter()
+        .map(|o| {
+            json!({
+                "id": o.firmware_version,
+                "version": o.firmware_version,
+                "title": "smart-coffee-enose",
+                "file_name": format!("firmware-{}.bin", o.firmware_version),
+                "data_size": o.file_size_bytes,
+                "checksum": o.checksum_sha256,
+                "created_time": o.created_at.timestamp_millis(),
+                "has_data": true,
+                "is_active": o.is_active,
+                "release_notes": o.release_notes,
+            })
+        })
+        .collect();
+    Ok(Json(json!(out)))
+}
+
+#[derive(Debug, Deserialize)]
+struct OtaAssign {
+    device_id: String,
+    package_id: String,
+}
+
+/// Activate package + tell the device to check OTA.
+async fn api_ota_assign(
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(b): Json<OtaAssign>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !operator_key_ok(&headers) {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "operator key required".into()));
+    }
+    let res = ota_activate(State(st.clone()), Path(b.package_id.clone())).await?;
+    let cmd = json!({
+        "id": Utc::now().timestamp_millis(), "device_id": b.device_id,
+        "type": "check_ota", "version": b.package_id, "status": "pending",
+        "created_at": Utc::now(),
+    });
+    st.devices.lock().await.entry(b.device_id.clone()).or_default().pending = Some(cmd);
+    Ok(Json(json!({ "ok": true, "activated": res.0, "device_id": b.device_id })))
+}
+
+async fn api_ota_device(State(st): State<AppState>, Path(id): Path<String>) -> Json<serde_json::Value> {
+    let g = st.devices.lock().await;
+    let ota = g
+        .get(&id)
+        .map(|r| device_json(&id, r)["ota"].clone())
+        .unwrap_or(json!({"state": "IDLE", "progress": 0.0, "message": null}));
+    Json(json!({ "device_id": id, "ota": ota }))
+}
+
+async fn api_export_json(State(st): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let all = fetch_range(&st.db, 525_600, 100_000, None).await?;
+    Ok(Json(json!(all.iter().map(measurement_json).collect::<Vec<_>>())))
 }
